@@ -1,4 +1,5 @@
 import type { DesktopCodePlugin } from "@bitsentry/plugin-sdk";
+import { Effect } from "effect";
 
 const SENTRY_API_BASE = "https://sentry.io/api/0";
 const DEFAULT_ISSUES_LIMIT = 50;
@@ -7,6 +8,28 @@ const MAX_ISSUES_LIMIT = 100;
 const MAX_EVENTS_LIMIT = 100;
 const SENTRY_ALLOWED_BASE_URLS_ENV = "SENTRY_ALLOWED_BASE_URLS";
 const SENTRY_BUILTIN_ALLOWED_HOSTS = new Set(["sentry.io"]);
+const SENTRY_REQUEST_TIMEOUT_MS = 30_000;
+
+async function runSentryRequest<T>(
+  operation: string,
+  execute: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: execute,
+      catch: (cause) =>
+        cause instanceof Error ? cause : new Error(`${operation} failed`),
+    }).pipe(
+      Effect.timeoutFail({
+        duration: SENTRY_REQUEST_TIMEOUT_MS,
+        onTimeout: () =>
+          new Error(
+            `${operation} timed out after ${String(SENTRY_REQUEST_TIMEOUT_MS)}ms`,
+          ),
+      }),
+    ),
+  );
+}
 
 function readString(value, fallback = "") {
   if (typeof value === "string") {
@@ -346,9 +369,24 @@ function retryDelay(response, fallbackMs) {
   return fallbackMs;
 }
 
-function wait(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+function wait(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -359,31 +397,34 @@ function shouldRetry(response, attempt, maxAttempts) {
 }
 
 async function requestSentry(url, init, maxAttempts = 5) {
-  let attempt = 0;
-  let delayMs = 1_000;
+  return runSentryRequest("Sentry API request", async (signal) => {
+    let attempt = 0;
+    let delayMs = 1_000;
 
-  while (attempt < maxAttempts) {
-    attempt += 1;
-    const response = await fetch(url, {
-      ...init,
-      redirect: "error",
-    });
-    if (response.ok) {
-      return response;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      const response = await fetch(url, {
+        ...init,
+        redirect: "error",
+        signal,
+      });
+      if (response.ok) {
+        return response;
+      }
+
+      if (!shouldRetry(response, attempt, maxAttempts)) {
+        const body = await response.text().catch(() => "");
+        throw new Error(
+          `Sentry API ${String(response.status)}: ${parseErrorBody(body)}`,
+        );
+      }
+
+      await wait(retryDelay(response, delayMs), signal);
+      delayMs = Math.min(delayMs * 2, 30_000);
     }
 
-    if (!shouldRetry(response, attempt, maxAttempts)) {
-      const body = await response.text().catch(() => "");
-      throw new Error(
-        `Sentry API ${String(response.status)}: ${parseErrorBody(body)}`,
-      );
-    }
-
-    await wait(retryDelay(response, delayMs));
-    delayMs = Math.min(delayMs * 2, 30_000);
-  }
-
-  throw new Error("Sentry API request failed after retries");
+    throw new Error("Sentry API request failed after retries");
+  });
 }
 
 function normalizeTokenResponse(payload) {
