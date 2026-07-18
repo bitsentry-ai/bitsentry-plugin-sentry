@@ -10,22 +10,78 @@ const SENTRY_ALLOWED_BASE_URLS_ENV = "SENTRY_ALLOWED_BASE_URLS";
 const SENTRY_BUILTIN_ALLOWED_HOSTS = new Set(["sentry.io"]);
 const SENTRY_REQUEST_TIMEOUT_MS = 30_000;
 
+type PluginOperationContext = {
+  signal?: AbortSignal;
+  deadlineAt?: number;
+};
+
+function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const activeSignals = signals.filter(
+    (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
+  );
+
+  if (signals.some((signal) => signal?.aborted === true)) {
+    abort();
+  } else {
+    for (const signal of activeSignals) {
+      signal.addEventListener("abort", abort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    dispose() {
+      for (const signal of activeSignals) {
+        signal.removeEventListener("abort", abort);
+      }
+    },
+  };
+}
+
+function operationTimeoutMs(operation?: PluginOperationContext): number {
+  if (typeof operation?.deadlineAt !== "number") {
+    return SENTRY_REQUEST_TIMEOUT_MS;
+  }
+
+  return Math.max(
+    0,
+    Math.min(SENTRY_REQUEST_TIMEOUT_MS, operation.deadlineAt - Date.now()),
+  );
+}
+
+function readOperationContext(context): PluginOperationContext | undefined {
+  return (context as { operation?: PluginOperationContext }).operation;
+}
+
 async function runSentryRequest<T>(
   operation: string,
+  parentOperation: PluginOperationContext | undefined,
   execute: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
+  const timeoutMs = operationTimeoutMs(parentOperation);
+
   return Effect.runPromise(
     Effect.tryPromise({
-      try: execute,
+      try: async (effectSignal) => {
+        const linkedSignal = linkAbortSignals([
+          parentOperation?.signal,
+          effectSignal,
+        ]);
+        try {
+          return await execute(linkedSignal.signal);
+        } finally {
+          linkedSignal.dispose();
+        }
+      },
       catch: (cause) =>
         cause instanceof Error ? cause : new Error(`${operation} failed`),
     }).pipe(
       Effect.timeoutFail({
-        duration: SENTRY_REQUEST_TIMEOUT_MS,
+        duration: timeoutMs,
         onTimeout: () =>
-          new Error(
-            `${operation} timed out after ${String(SENTRY_REQUEST_TIMEOUT_MS)}ms`,
-          ),
+          new Error(`${operation} timed out after ${String(timeoutMs)}ms`),
       }),
     ),
   );
@@ -396,8 +452,8 @@ function shouldRetry(response, attempt, maxAttempts) {
   );
 }
 
-async function requestSentry(url, init, maxAttempts = 5) {
-  return runSentryRequest("Sentry API request", async (signal) => {
+async function requestSentry(url, init, maxAttempts = 5, operation) {
+  return runSentryRequest("Sentry API request", operation, async (signal) => {
     let attempt = 0;
     let delayMs = 1_000;
 
@@ -482,7 +538,8 @@ function buildAuthorizeUrl({ auth, input }) {
   };
 }
 
-async function exchangeCodeForToken({ auth, input }) {
+async function exchangeCodeForToken(context) {
+  const { auth, input } = context;
   const payload = new URLSearchParams({
     client_id: requireString(input.clientId, "clientId"),
     client_secret: readString(input.clientSecret),
@@ -491,13 +548,18 @@ async function exchangeCodeForToken({ auth, input }) {
     redirect_uri: requireString(input.redirectUri, "redirectUri"),
     code_verifier: requireString(input.codeVerifier, "codeVerifier"),
   });
-  const response = await requestSentry(buildOAuthUrl(auth, "/oauth/token/"), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
+  const response = await requestSentry(
+    buildOAuthUrl(auth, "/oauth/token/"),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: payload.toString(),
     },
-    body: payload.toString(),
-  });
+    5,
+    readOperationContext(context),
+  );
 
   return {
     status: 200,
@@ -506,20 +568,26 @@ async function exchangeCodeForToken({ auth, input }) {
   };
 }
 
-async function refreshToken({ auth, input }) {
+async function refreshToken(context) {
+  const { auth, input } = context;
   const payload = new URLSearchParams({
     client_id: requireString(input.clientId, "clientId"),
     client_secret: readString(input.clientSecret),
     grant_type: "refresh_token",
     refresh_token: requireString(input.refreshToken, "refreshToken"),
   });
-  const response = await requestSentry(buildOAuthUrl(auth, "/oauth/token/"), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
+  const response = await requestSentry(
+    buildOAuthUrl(auth, "/oauth/token/"),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: payload.toString(),
     },
-    body: payload.toString(),
-  });
+    5,
+    readOperationContext(context),
+  );
 
   return {
     status: 200,
@@ -528,12 +596,18 @@ async function refreshToken({ auth, input }) {
   };
 }
 
-async function listOrganizations({ auth }) {
+async function listOrganizations(context) {
+  const { auth } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const apiBase = readApiBase(auth);
-  const response = await requestSentry(`${apiBase}/organizations/`, {
-    headers: authHeaders(accessToken),
-  });
+  const response = await requestSentry(
+    `${apiBase}/organizations/`,
+    {
+      headers: authHeaders(accessToken),
+    },
+    5,
+    readOperationContext(context),
+  );
   const organizations = parseJsonArray(await response.json()).map((item) => {
     const slug = readString(item.slug, readString(item.id));
     return {
@@ -549,7 +623,8 @@ async function listOrganizations({ auth }) {
   };
 }
 
-async function listProjects({ auth, input }) {
+async function listProjects(context) {
+  const { auth, input } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const orgSlug = requireString(input.orgSlug, "orgSlug");
   const apiBase = readApiBase(auth);
@@ -558,6 +633,8 @@ async function listProjects({ auth, input }) {
     {
       headers: authHeaders(accessToken),
     },
+    5,
+    readOperationContext(context),
   );
   const projects = parseJsonArray(await response.json()).map((item) => {
     const id = readString(item.id);
@@ -577,27 +654,31 @@ async function listProjects({ auth, input }) {
   };
 }
 
-async function queryIssues({ auth, input }) {
+async function queryIssues(context) {
+  const { auth, input } = context;
   return fetchIssues({
     auth,
     input: {
       ...input,
       query: readString(input.query),
     },
+    operation: readOperationContext(context),
   });
 }
 
-async function listIssues({ auth, input }) {
+async function listIssues(context) {
+  const { auth, input } = context;
   return fetchIssues({
     auth,
     input: {
       ...input,
       query: buildLastSeenQuery(input.since, input.until),
     },
+    operation: readOperationContext(context),
   });
 }
 
-async function fetchIssues({ auth, input }) {
+async function fetchIssues({ auth, input, operation }) {
   const accessToken = requireString(auth.accessToken, "accessToken");
   const orgSlug = requireString(input.orgSlug, "orgSlug");
   const apiBase = readApiBase(auth);
@@ -615,9 +696,14 @@ async function fetchIssues({ auth, input }) {
     limit,
     query: input.query,
   });
-  const response = await requestSentry(url.toString(), {
-    headers: authHeaders(accessToken),
-  });
+  const response = await requestSentry(
+    url.toString(),
+    {
+      headers: authHeaders(accessToken),
+    },
+    5,
+    operation,
+  );
   const issues = parseJsonArray(await response.json());
   const page = parseNextCursor(response.headers.get("link"));
 
@@ -632,7 +718,8 @@ async function fetchIssues({ auth, input }) {
   };
 }
 
-async function listIssueEvents({ auth, input }) {
+async function listIssueEvents(context) {
+  const { auth, input } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const orgSlug = requireString(input.orgSlug, "orgSlug");
   const issueId = requireString(input.issueId, "issueId");
@@ -662,9 +749,14 @@ async function listIssueEvents({ auth, input }) {
     url.searchParams.set("end", until);
   }
 
-  const response = await requestSentry(url.toString(), {
-    headers: authHeaders(accessToken),
-  });
+  const response = await requestSentry(
+    url.toString(),
+    {
+      headers: authHeaders(accessToken),
+    },
+    5,
+    readOperationContext(context),
+  );
   const events = parseJsonArray(await response.json());
   const page = parseNextCursor(response.headers.get("link"));
 

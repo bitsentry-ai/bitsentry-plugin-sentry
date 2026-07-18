@@ -133,6 +133,44 @@ describe("Sentry plugin package", () => {
     expect(request?.redirect).toBe("error");
   });
 
+  it("aborts an in-flight API request when the parent operation is cancelled", async () => {
+    vi.stubEnv("SENTRY_ALLOWED_BASE_URLS", "sentry.example.com");
+    const controller = new AbortController();
+    let requestSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      (_url: string, request?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignal = request?.signal ?? undefined;
+          requestSignal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted")),
+            {
+              once: true,
+            },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = action("list_organizations").execute({
+      pluginId: plugin.id,
+      actionId: "list_organizations",
+      auth: {
+        accessToken: "sentry-token",
+        baseUrl: "https://sentry.example.com",
+      },
+      input: {},
+      host,
+      operation: { signal: controller.signal },
+    } as DesktopPluginCodeActionContext);
+
+    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+    controller.abort();
+
+    await expect(result).rejects.toThrow();
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
   it("applies configured project slug filters to issue queries", async () => {
     vi.stubEnv("SENTRY_ALLOWED_BASE_URLS", "sentry.example.com");
     const fetchMock = vi
