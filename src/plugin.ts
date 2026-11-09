@@ -24,7 +24,7 @@ function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
     (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
   );
 
-  if (signals.some((signal) => signal?.aborted === true)) {
+  if (signals.some((signal) => signal?.aborted)) {
     abort();
   } else {
     for (const signal of activeSignals) {
@@ -458,7 +458,7 @@ function shouldRetry(response, attempt, maxAttempts) {
   );
 }
 
-async function requestSentry(url, init, maxAttempts = 5, operation) {
+async function requestSentry(url, init, maxAttempts, operation) {
   return runSentryRequest("Sentry API request", operation, async (signal) => {
     let attempt = 0;
     let delayMs = 1_000;
