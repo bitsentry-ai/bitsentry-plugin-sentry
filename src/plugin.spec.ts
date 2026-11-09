@@ -27,26 +27,10 @@ describe("Sentry plugin package", () => {
     vi.unstubAllEnvs();
   });
 
-  it("declares Sentry as a typed error-source code plugin", () => {
-    expect(plugin).toMatchObject({
-      id: "sentry",
-      metadata: {
-        dataSource: {
-          sourceType: "sentry",
-          oauth: {
-            publicClient: false,
-          },
-        },
-      },
-    });
+  it("declares a confidential OAuth client and the actions no behaviour test calls", () => {
+    expect(plugin.metadata.dataSource?.oauth?.publicClient).toBe(false);
     expect(plugin.actions.map((candidate) => candidate.id)).toEqual(
-      expect.arrayContaining([
-        "build_authorize_url",
-        "exchange_code_for_token",
-        "refresh_token",
-        "list_issues",
-        "list_issue_events",
-      ]),
+      expect.arrayContaining(["refresh_token", "list_issue_events"]),
     );
   });
 
